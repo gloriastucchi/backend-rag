@@ -74,20 +74,20 @@ async def extract_requirements(
 
             sb = get_supabase()
 
-            # 3a) crea record documento
             doc_ins = (
                 sb.table("rfq_documents")
-                  .insert({
-                      "project_id": project_id,
-                      "title": title or file.filename,
-                      "status": "extracted",
-                      "file_name": file.filename,
-                  })
-                  .select("id")
-                  .single()
-                  .execute()
+                .insert({
+                    "project_id": project_id,
+                    "title": title or file.filename,
+                    "status": "extracted",
+                    "file_name": file.filename,
+                })
+                .execute()
             )
-            doc_id = doc_ins.data["id"]
+
+            # Now get the inserted ID from doc_ins.data
+            doc_id = doc_ins.data[0]["id"]
+
 
             # 3b) bulk insert requisiti
             rows = [{
