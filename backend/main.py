@@ -58,38 +58,45 @@ async def extract_requirements(
 ):
     tmp_path = None
     try:
-        # 1) salva il PDF su /tmp
+        # 1) save the PDF to /tmp
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             shutil.copyfileobj(file.file, tmp)
             tmp_path = tmp.name
 
-        # 2) estrai i requisiti
+        # 2) extract requirements
         reqs = extract_requirements_from_file(tmp_path)
         result: Dict[str, Any] = {"requirements": reqs}
 
-        # 3) opzionale: persisti su Supabase
+        # 3) optional: persist to Supabase
         if save:
             if not project_id:
                 raise HTTPException(status_code=400, detail="project_id required when save=true")
 
             sb = get_supabase()
 
+            # 3a) create document row (no .select() – just .execute())
             doc_ins = (
                 sb.table("rfq_documents")
-                .insert({
-                    "project_id": project_id,
-                    "title": title or file.filename,
-                    "status": "extracted",
-                    "file_name": file.filename,
-                })
-                .execute()
+                  .insert({
+                      "project_id": project_id,
+                      "title": title or file.filename,
+                      "status": "extracted",
+                      "file_name": file.filename,
+                  })
+                  .execute()
             )
 
-            # Now get the inserted ID from doc_ins.data
-            doc_id = doc_ins.data[0]["id"]
+            # doc_ins.data should be a list with the inserted row
+            if not doc_ins or not getattr(doc_ins, "data", None):
+                raise HTTPException(status_code=500, detail="Failed to insert rfq_documents")
 
+            doc_id = doc_ins.data[0].get("id")
+            if not doc_id:
+                # If your Postgres isn’t returning values, enable “returning=representation”
+                # or fetch the row another way. But usually data[0]['id'] is present.
+                raise HTTPException(status_code=500, detail="Inserted document id not returned")
 
-            # 3b) bulk insert requisiti
+            # 3b) bulk insert requirements
             rows = [{
                 "document_id": doc_id,
                 "req_id": r.get("id"),
@@ -97,14 +104,17 @@ async def extract_requirements(
                 "type": r.get("type"),
                 "section": r.get("section"),
                 "confidence": r.get("confidence"),
-            } for r in reqs]
+            } for r in (reqs or [])]
 
             if rows:
-                sb.table("rfq_requirements").insert(rows).execute()
+                ins_reqs = sb.table("rfq_requirements").insert(rows).execute()
+                # Optional sanity check
+                if ins_reqs is None:
+                    raise HTTPException(status_code=500, detail="Failed to insert rfq_requirements")
 
             result["document_id"] = doc_id
 
-        # 4) opzionale: payload di debug
+        # 4) optional: debug payload
         if debug:
             from modules.extract import _read_pdf
             pages = _read_pdf(tmp_path)
@@ -126,6 +136,7 @@ async def extract_requirements(
                 os.remove(tmp_path)
             except Exception:
                 pass
+
 
 
 @app.post("/search-docs", response_model=SearchResponse)
