@@ -46,6 +46,8 @@ class GenerateResponse(BaseModel):
 
 # ---------- ENDPOINTS ----------
 
+import traceback
+
 @app.post("/extract-requirements")
 async def extract_requirements(
     file: UploadFile = File(...),
@@ -80,8 +82,6 @@ async def extract_requirements(
                       "title": title or file.filename,
                       "status": "extracted",
                       "file_name": file.filename,
-                      # UploadFile non dà size affidabile; opzionale:
-                      # "file_size": getattr(file.file, "size", None),
                   })
                   .select("id")
                   .single()
@@ -112,6 +112,13 @@ async def extract_requirements(
             result.update({"debug_sample": sample, "pages": len(pages)})
 
         return result
+
+    except Exception as e:
+        print("\n--- ERROR in /extract-requirements ---")
+        print(str(e))
+        traceback.print_exc()
+        print("--- END ERROR ---\n")
+        raise HTTPException(status_code=500, detail=str(e))
 
     finally:
         if tmp_path and os.path.exists(tmp_path):
