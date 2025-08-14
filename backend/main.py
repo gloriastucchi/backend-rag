@@ -110,19 +110,19 @@ async def extract_requirements(
 
         return result
 
-            except Exception as e:
-                print("\n--- ERROR in /extract-requirements ---")
-                print(str(e))
-                traceback.print_exc()
-                print("--- END ERROR ---\n")
-                raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        print("\n--- ERROR in /extract-requirements ---")
+        print(str(e))
+        traceback.print_exc()
+        print("--- END ERROR ---\n")
+        raise HTTPException(status_code=500, detail=str(e))
 
-            finally:
-                if tmp_path and os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except Exception:
-                        pass
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 
