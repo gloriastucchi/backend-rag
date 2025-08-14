@@ -67,36 +67,30 @@ async def extract_requirements(
         reqs = extract_requirements_from_file(tmp_path)
         result: Dict[str, Any] = {"requirements": reqs}
 
-        # 3) optional: persist to Supabase
         if save:
             if not project_id:
                 raise HTTPException(status_code=400, detail="project_id required when save=true")
 
             sb = get_supabase()
 
-            # 3a) create document row (no .select() – just .execute())
-            doc_ins = (
-                sb.table("rfq_documents")
-                  .insert({
-                      "project_id": project_id,
-                      "title": title or file.filename,
-                      "status": "extracted",
-                      "file_name": file.filename,
-                  })
-                  .execute()
-            )
-
-            # doc_ins.data should be a list with the inserted row
+            # 3a) create document row with an allowed status
+            payload = {
+                "project_id": project_id,
+                "title": title or file.filename,
+                "file_name": file.filename,
+                "status": "uploaded",          # ✅ allowed by your CHECK
+                # "user_id": <add later when you have auth/JWT>,
+                # "user_email": <optional mirror>
+            }
+            doc_ins = sb.table("rfq_documents").insert(payload).execute()
             if not doc_ins or not getattr(doc_ins, "data", None):
                 raise HTTPException(status_code=500, detail="Failed to insert rfq_documents")
-
             doc_id = doc_ins.data[0].get("id")
-            if not doc_id:
-                # If your Postgres isn’t returning values, enable “returning=representation”
-                # or fetch the row another way. But usually data[0]['id'] is present.
-                raise HTTPException(status_code=500, detail="Inserted document id not returned")
 
-            # 3b) bulk insert requirements
+            # 3b) (optional) mark as analyzing
+            sb.table("rfq_documents").update({"status": "analyzing"}).eq("id", doc_id).execute()
+
+            # 3c) bulk insert requirements
             rows = [{
                 "document_id": doc_id,
                 "req_id": r.get("id"),
@@ -107,35 +101,28 @@ async def extract_requirements(
             } for r in (reqs or [])]
 
             if rows:
-                ins_reqs = sb.table("rfq_requirements").insert(rows).execute()
-                # Optional sanity check
-                if ins_reqs is None:
-                    raise HTTPException(status_code=500, detail="Failed to insert rfq_requirements")
+                sb.table("rfq_requirements").insert(rows).execute()
+
+            # 3d) finally mark as analyzed
+            sb.table("rfq_documents").update({"status": "analyzed"}).eq("id", doc_id).execute()
 
             result["document_id"] = doc_id
 
-        # 4) optional: debug payload
-        if debug:
-            from modules.extract import _read_pdf
-            pages = _read_pdf(tmp_path)
-            sample = pages[0][1][:500] if pages else ""
-            result.update({"debug_sample": sample, "pages": len(pages)})
-
         return result
 
-    except Exception as e:
-        print("\n--- ERROR in /extract-requirements ---")
-        print(str(e))
-        traceback.print_exc()
-        print("--- END ERROR ---\n")
-        raise HTTPException(status_code=500, detail=str(e))
+            except Exception as e:
+                print("\n--- ERROR in /extract-requirements ---")
+                print(str(e))
+                traceback.print_exc()
+                print("--- END ERROR ---\n")
+                raise HTTPException(status_code=500, detail=str(e))
 
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
 
 
 
