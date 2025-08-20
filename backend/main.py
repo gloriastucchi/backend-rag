@@ -126,6 +126,67 @@ async def extract_requirements(
 
 
 
+@app.post("/extract-requirements-from-doc")
+async def extract_requirements_from_existing_doc(
+    document_id: str,
+    save: bool = True
+):
+    """
+    Use when the PDF is already uploaded+tracked in rfq_documents.
+    We fetch it from Supabase Storage (bucket rfq_documents), run extraction,
+    and write results to rfq_requirements.
+    """
+
+    sb = get_supabase()
+
+    # 0) fetch rfq_documents row
+    res = sb.table("rfq_documents").select("*").eq("id", document_id).single().execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="document not found")
+
+    doc = res.data
+    file_path = doc.get("file_path")   # e.g. "user123/abc/testRFP.pdf"
+    if not file_path:
+        raise HTTPException(status_code=400, detail="file_path missing on rfq_documents")
+
+    bucket = "rfq_documents"
+
+    # 1) download file temporarily
+    client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
+    
+    try:
+        file_bytes = client.storage.from_(bucket).download(file_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unable to download: {e}")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
+    # 2) extract requirements
+    reqs = extract_requirements_from_file(tmp_path)
+
+    # delete tmp
+    os.remove(tmp_path)
+
+    # 3) optionally save to rfq_requirements
+    if save and reqs:
+        rows = [{
+            "document_id": document_id,
+            "req_id": r.get("id"),
+            "text": r.get("text"),
+            "type": r.get("type"),
+            "section": r.get("section"),
+            "confidence": r.get("confidence"),
+        } for r in reqs]
+        sb.table("rfq_requirements").insert(rows).execute()
+
+    return {
+        "document_id": document_id,
+        "requirements": reqs
+    }
+
+
 @app.post("/search-docs", response_model=SearchResponse)
 async def search_docs(req: Requirement):
     try:
