@@ -6,6 +6,8 @@ import tempfile
 import os
 import shutil
 from dotenv import load_dotenv
+from supabase import create_client
+from modules.supabase_client import get_supabase
 
 load_dotenv()
 
