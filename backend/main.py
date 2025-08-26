@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any
 import tempfile
+from modules.auth import get_user_id
 import os
 import shutil
 from dotenv import load_dotenv
@@ -285,7 +286,7 @@ def kb_search(payload: SearchIn, user_id: str = Depends(get_user_id)):
 
 
 @app.post("/kb/process")
-async def kb_process(doc_id: str, user_id: str = Depends(...)):
+async def kb_process(doc_id: str, user_id: str = Depends(get_user_id)):
     sb = get_supabase()
     svc = get_service_client()
 
