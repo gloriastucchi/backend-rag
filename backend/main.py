@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any
 import tempfile
-from modules.auth import get_user_id
 import os
 import shutil
 from dotenv import load_dotenv
@@ -19,6 +18,7 @@ from uuid import uuid4
 from modules.supabase_client import get_service_client
 from modules.embed import embed_and_upsert_document_text, delete_document_chunks
 import os
+from fastapi import Header
 
 
 load_dotenv()
@@ -42,15 +42,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_user_id() -> str:
+async def get_user_id(
+    x_user_id: str = Header(..., convert_underscores=False)
+) -> str:
     """
-    DEV: prende l'utente da ENV `DEV_USER_ID`.
-    In prod sostituisci con estrazione dal JWT.
+    Richiede SEMPRE l'header X-User-Id.
+    Se manca, FastAPI risponde 422 automaticamente.
     """
-    uid = os.getenv("DEV_USER_ID")
-    if not uid:
-        raise HTTPException(401, "Missing user id (set DEV_USER_ID or wire JWT auth)")
-    return uid
+    return x_user_id
 
 KB_BUCKET = os.getenv("KB_BUCKET", "project-kb")
 
@@ -210,10 +209,13 @@ async def kb_upload(
 class EmbedOneIn(BaseModel):
     document_id: str  # uuid
 
+class EmbedOneIn(BaseModel):
+    document_id: str  # uuid
+
 @app.post("/kb/embed-one")
 def kb_embed_one(body: EmbedOneIn, user_id: str = Depends(get_user_id)):
-    sb = get_supabase()
-    svc = get_service_client()
+    sb = get_service_client()   # ✅ service role per DB
+    storage = sb.storage        # ✅ e per Storage
 
     doc = sb.table("user_documents").select("*").eq("id", body.document_id).single().execute().data
     if not doc:
@@ -221,25 +223,28 @@ def kb_embed_one(body: EmbedOneIn, user_id: str = Depends(get_user_id)):
     if doc["user_id"] != user_id:
         raise HTTPException(403, "Forbidden")
 
-    filename = doc.get("filename") or doc.get("file_name")
-    path = doc.get("storage_path") or doc.get("file_path")
+    filename = doc.get("file_name") or doc.get("filename")
+    path = doc.get("file_path") or doc.get("storage_path")
     if not filename or not path:
         raise HTTPException(400, "Missing filename/storage_path")
 
-    file_bytes = svc.storage.from_(KB_BUCKET).download(path)
-    if file_bytes is None:
-        raise HTTPException(500, "Storage download failed")
+    try:
+        file_bytes = storage.from_(KB_BUCKET).download(path)
+    except Exception as e:
+        raise HTTPException(500, f"Storage download failed: {e}")
 
     delete_document_chunks(body.document_id)
     text = _extract_text_from_bytes(file_bytes, filename)
     if not text.strip():
         raise HTTPException(400, "No extractable text")
 
-    summary = embed_and_upsert_document_text(text=text, user_id=user_id, document_id=body.document_id)
+    summary = embed_and_upsert_document_text(
+        text=text,
+        user_id=user_id,
+        document_id=body.document_id
+    )
     return {"document_id": body.document_id, "embedded_chunks": summary["chunks"]}
 
-class SearchIn(BaseModel):
-    query: str
 
 @app.post("/kb/search")
 def kb_search(payload: SearchIn, user_id: str = Depends(get_user_id)):
@@ -287,44 +292,42 @@ def kb_search(payload: SearchIn, user_id: str = Depends(get_user_id)):
 
 @app.post("/kb/process")
 async def kb_process(doc_id: str, user_id: str = Depends(get_user_id)):
-    sb = get_supabase()
-    svc = get_service_client()
+    sb = get_service_client()   # ✅ service role
+    storage = sb.storage
 
-    # 0) fetch doc
-    doc = sb.table("kb_documents").select("*").eq("id", doc_id).single().execute().data
+    # 0) fetch doc (nuova tabella)
+    doc = sb.table("user_documents").select("*").eq("id", doc_id).single().execute().data
     if not doc or doc["user_id"] != user_id:
         raise HTTPException(404, "Document not found")
 
-    # 1) download
-    raw = svc.storage.from_("kb_documents").download(doc["file_path"])
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(raw)
-        tmp_path = tmp.name
+    filename = doc.get("file_name") or doc.get("filename")
+    path = doc.get("file_path") or doc.get("storage_path")
+    if not filename or not path:
+        raise HTTPException(400, "Missing filename/storage_path")
 
-    # 2) estrai testo + chunking (usa il tuo parser PDF)
-    from modules.text import extract_text, chunk_text
-    text = extract_text(tmp_path)
-    chunks = chunk_text(text, size=900, overlap=150)
+    # 1) download bytes dal bucket corretto
+    try:
+        file_bytes = storage.from_(KB_BUCKET).download(path)
+    except Exception as e:
+        raise HTTPException(500, f"Download failed: {e}")
 
-    # 3) embeddings
-    embs = embed_texts([c["content"] for c in chunks])  # -> list[list[float]]
+    # 2) estrai testo e indicizza (riusa la pipeline)
+    text = _extract_text_from_bytes(file_bytes, filename)
+    if not text.strip():
+        raise HTTPException(400, "No extractable text")
 
-    rows = []
-    for i, c in enumerate(chunks):
-        rows.append({
-            "user_id": user_id,
-            "project_id": doc["project_id"],
-            "doc_id": doc_id,
-            "chunk_idx": i,
-            "content": c["content"],
-            "embedding": embs[i],
-        })
+    delete_document_chunks(doc_id)
+    summary = embed_and_upsert_document_text(
+        text=text,
+        user_id=user_id,
+        document_id=doc_id
+    )
 
-    if rows:
-        sb.table("kb_embeddings").insert(rows).execute()
-        sb.table("kb_documents").update({"status": "ready"}).eq("id", doc_id).execute()
-    os.remove(tmp_path)
-    return {"chunks": len(rows), "status": "ready"}
+    # opzionale: marca come indicizzato se hai la colonna
+    # sb.table("user_documents").update({"indexed_at": "now()"}).eq("id", doc_id).execute()
+
+    return {"document_id": doc_id, "embedded_chunks": summary["chunks"], "status": "ready"}
+
 
 @app.post("/extract-requirements-from-doc")
 async def extract_requirements_from_existing_doc(
