@@ -8,6 +8,17 @@ import shutil
 from dotenv import load_dotenv
 from supabase import create_client
 from modules.supabase_client import get_supabase
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
+from modules.supabase_client import get_supabase, get_service_client  # come hai già fatto
+from modules.embed import embed_texts  # wrapper openai embeddings
+import tempfile, os, shutil
+from uuid import uuid4
+from fastapi import Depends, Body
+from uuid import uuid4
+from modules.supabase_client import get_service_client
+from modules.embed import embed_and_upsert_document_text, delete_document_chunks
+import os
+
 
 load_dotenv()
 
@@ -29,6 +40,30 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+def get_user_id() -> str:
+    """
+    DEV: prende l'utente da ENV `DEV_USER_ID`.
+    In prod sostituisci con estrazione dal JWT.
+    """
+    uid = os.getenv("DEV_USER_ID")
+    if not uid:
+        raise HTTPException(401, "Missing user id (set DEV_USER_ID or wire JWT auth)")
+    return uid
+
+KB_BUCKET = os.getenv("KB_BUCKET", "project-kb")
+
+def _extract_text_from_bytes(data: bytes, filename: str) -> str:
+    name = (filename or "").lower()
+    if name.endswith(".pdf"):
+        import fitz  # PyMuPDF
+        doc = fitz.open(stream=data, filetype="pdf")
+        return "\n".join(p.get_text("text") for p in doc)
+    try:
+        return data.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
 
 # ---------- MODELS ----------
 class Requirement(BaseModel):
@@ -127,6 +162,168 @@ async def extract_requirements(
                 pass
 
 
+@app.post("/kb/upload")
+async def kb_upload(
+    file: UploadFile = File(...),
+    user_id: str = Depends(get_user_id),
+):
+    sb = get_supabase()
+    svc = get_service_client()
+
+    # 1) Storage upload: userId/<uuid>_<original>
+    storage_path = f"{user_id}/{uuid4()}_{file.filename}"
+    file_bytes = await file.read()
+    try:
+        svc.storage.from_(KB_BUCKET).upload(storage_path, file_bytes)
+    except Exception as e:
+        raise HTTPException(500, f"Storage upload failed: {e}")
+
+    # 2) Insert in user_documents (compatibile con filename/file_name)
+    payload = {
+        "user_id": user_id,
+        "filename": file.filename,
+        "storage_path": storage_path,
+        "file_name": file.filename,   # se la colonna non esiste viene ignorato da PostgREST
+        "file_path": storage_path,
+        "checksum": None,
+    }
+    ins = sb.table("user_documents").insert(payload).select("id, filename, file_name").single().execute()
+    if not ins or not getattr(ins, "data", None):
+        raise HTTPException(500, "DB insert failed for user_documents")
+    document_id = ins.data["id"]
+    filename = ins.data.get("filename") or ins.data.get("file_name") or file.filename
+
+    # 3) Estrai testo e crea embedding
+    text = _extract_text_from_bytes(file_bytes, filename)
+    if not text.strip():
+        raise HTTPException(400, "No extractable text")
+
+    delete_document_chunks(document_id)  # idempotenza
+    summary = embed_and_upsert_document_text(text=text, user_id=user_id, document_id=document_id)
+
+    # opzionale: marca come indicizzato se hai la colonna indexed_at
+    # sb.table("user_documents").update({"indexed_at": "now()"}).eq("id", document_id).execute()
+
+    return {"document_id": document_id, "embedded_chunks": summary["chunks"]}
+
+class EmbedOneIn(BaseModel):
+    document_id: str  # uuid
+
+@app.post("/kb/embed-one")
+def kb_embed_one(body: EmbedOneIn, user_id: str = Depends(get_user_id)):
+    sb = get_supabase()
+    svc = get_service_client()
+
+    doc = sb.table("user_documents").select("*").eq("id", body.document_id).single().execute().data
+    if not doc:
+        raise HTTPException(404, "Document not found")
+    if doc["user_id"] != user_id:
+        raise HTTPException(403, "Forbidden")
+
+    filename = doc.get("filename") or doc.get("file_name")
+    path = doc.get("storage_path") or doc.get("file_path")
+    if not filename or not path:
+        raise HTTPException(400, "Missing filename/storage_path")
+
+    file_bytes = svc.storage.from_(KB_BUCKET).download(path)
+    if file_bytes is None:
+        raise HTTPException(500, "Storage download failed")
+
+    delete_document_chunks(body.document_id)
+    text = _extract_text_from_bytes(file_bytes, filename)
+    if not text.strip():
+        raise HTTPException(400, "No extractable text")
+
+    summary = embed_and_upsert_document_text(text=text, user_id=user_id, document_id=body.document_id)
+    return {"document_id": body.document_id, "embedded_chunks": summary["chunks"]}
+
+class SearchIn(BaseModel):
+    query: str
+
+@app.post("/kb/search")
+def kb_search(payload: SearchIn, user_id: str = Depends(get_user_id)):
+    from openai import OpenAI
+    import psycopg2, psycopg2.extras
+
+    EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
+    qvec = OpenAI().embeddings.create(model=EMBED_MODEL, input=payload.query).data[0].embedding
+
+    pg_url = os.getenv("SUPABASE_DB_CONNECTION_STRING")  # postgres://user:pass@host:port/db
+    if not pg_url:
+        raise HTTPException(500, "Missing SUPABASE_DB_CONNECTION_STRING")
+
+    sql = """
+    select
+      ue.document_id,
+      ue.chunk_index,
+      ue.content,
+      (ue.embedding <-> %s) as distance,
+      ud.filename, ud.file_name, ud.storage_path, ud.file_path, ud.created_at
+    from user_embeddings ue
+    join user_documents ud on ud.id = ue.document_id
+    where ue.user_id = %s
+    order by ue.embedding <-> %s
+    limit 10;
+    """
+
+    try:
+        conn = psycopg2.connect(pg_url)
+        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, (qvec, user_id, qvec))
+            rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        raise HTTPException(500, f"Search failed: {e}")
+
+    # normalizza campi per il frontend
+    for r in rows:
+        r["filename"] = r.get("filename") or r.get("file_name")
+        r["storage_path"] = r.get("storage_path") or r.get("file_path")
+
+    return {"results": rows}
+
+
+
+@app.post("/kb/process")
+async def kb_process(doc_id: str, user_id: str = Depends(...)):
+    sb = get_supabase()
+    svc = get_service_client()
+
+    # 0) fetch doc
+    doc = sb.table("kb_documents").select("*").eq("id", doc_id).single().execute().data
+    if not doc or doc["user_id"] != user_id:
+        raise HTTPException(404, "Document not found")
+
+    # 1) download
+    raw = svc.storage.from_("kb_documents").download(doc["file_path"])
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(raw)
+        tmp_path = tmp.name
+
+    # 2) estrai testo + chunking (usa il tuo parser PDF)
+    from modules.text import extract_text, chunk_text
+    text = extract_text(tmp_path)
+    chunks = chunk_text(text, size=900, overlap=150)
+
+    # 3) embeddings
+    embs = embed_texts([c["content"] for c in chunks])  # -> list[list[float]]
+
+    rows = []
+    for i, c in enumerate(chunks):
+        rows.append({
+            "user_id": user_id,
+            "project_id": doc["project_id"],
+            "doc_id": doc_id,
+            "chunk_idx": i,
+            "content": c["content"],
+            "embedding": embs[i],
+        })
+
+    if rows:
+        sb.table("kb_embeddings").insert(rows).execute()
+        sb.table("kb_documents").update({"status": "ready"}).eq("id", doc_id).execute()
+    os.remove(tmp_path)
+    return {"chunks": len(rows), "status": "ready"}
 
 @app.post("/extract-requirements-from-doc")
 async def extract_requirements_from_existing_doc(
