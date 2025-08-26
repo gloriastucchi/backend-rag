@@ -167,31 +167,30 @@ async def kb_upload(
     file: UploadFile = File(...),
     user_id: str = Depends(get_user_id),
 ):
-    sb = get_supabase()
-    svc = get_service_client()
+    # usa SEMPRE il service client nel backend per storage + DB write
+    sb = get_service_client()
+    storage = sb.storage
 
     # 1) Storage upload: userId/<uuid>_<original>
     storage_path = f"{user_id}/{uuid4()}_{file.filename}"
     file_bytes = await file.read()
     try:
-        svc.storage.from_(KB_BUCKET).upload(storage_path, file_bytes)
+        storage.from_(KB_BUCKET).upload(storage_path, file_bytes)
     except Exception as e:
         raise HTTPException(500, f"Storage upload failed: {e}")
 
-    # 2) Insert in user_documents (compatibile con filename/file_name)
+    # 2) Insert in user_documents (schema attuale: file_name/file_path)
     payload = {
         "user_id": user_id,
-        "filename": file.filename,
-        "storage_path": storage_path,
-        "file_name": file.filename,   # se la colonna non esiste viene ignorato da PostgREST
+        "file_name": file.filename,
         "file_path": storage_path,
         "checksum": None,
     }
-    ins = sb.table("user_documents").insert(payload).select("id, filename, file_name").single().execute()
+    ins = sb.table("user_documents").insert(payload).select("id, file_name").single().execute()
     if not ins or not getattr(ins, "data", None):
         raise HTTPException(500, "DB insert failed for user_documents")
     document_id = ins.data["id"]
-    filename = ins.data.get("filename") or ins.data.get("file_name") or file.filename
+    filename = ins.data.get("file_name") or file.filename
 
     # 3) Estrai testo e crea embedding
     text = _extract_text_from_bytes(file_bytes, filename)
@@ -199,10 +198,11 @@ async def kb_upload(
         raise HTTPException(400, "No extractable text")
 
     delete_document_chunks(document_id)  # idempotenza
-    summary = embed_and_upsert_document_text(text=text, user_id=user_id, document_id=document_id)
-
-    # opzionale: marca come indicizzato se hai la colonna indexed_at
-    # sb.table("user_documents").update({"indexed_at": "now()"}).eq("id", document_id).execute()
+    summary = embed_and_upsert_document_text(
+        text=text,
+        user_id=user_id,
+        document_id=document_id,
+    )
 
     return {"document_id": document_id, "embedded_chunks": summary["chunks"]}
 
