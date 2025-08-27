@@ -1,24 +1,18 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Depends, Header, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any
-import tempfile
+from dotenv import load_dotenv
+from uuid import uuid4
 import os
 import shutil
-from dotenv import load_dotenv
-from supabase import create_client
-from modules.supabase_client import get_supabase
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
-from modules.supabase_client import get_supabase, get_service_client  # come hai già fatto
-from modules.embed import embed_texts  # wrapper openai embeddings
-import tempfile, os, shutil
-from uuid import uuid4
-from fastapi import Depends, Body
-from uuid import uuid4
-from modules.supabase_client import get_service_client
+import tempfile
+import traceback
+
+from supabase import create_client  # serve solo nell'endpoint extract-requirements-from-doc
+from modules.supabase_client import get_supabase, get_service_client
 from modules.embed import embed_and_upsert_document_text, delete_document_chunks
-import os
-from fastapi import Header
+from modules.extract import extract_requirements_from_file
 
 
 load_dotenv()
@@ -80,6 +74,10 @@ class GenerateRequest(BaseModel):
 class GenerateResponse(BaseModel):
     answer: str
     references: List[str]
+
+class SearchIn(BaseModel):
+    query: str
+
 
 # ---------- ENDPOINTS ----------
 
@@ -209,9 +207,6 @@ async def kb_upload(
 class EmbedOneIn(BaseModel):
     document_id: str  # uuid
 
-class EmbedOneIn(BaseModel):
-    document_id: str  # uuid
-
 @app.post("/kb/embed-one")
 def kb_embed_one(body: EmbedOneIn, user_id: str = Depends(get_user_id)):
     sb = get_service_client()   # ✅ service role per DB
@@ -287,7 +282,6 @@ def kb_search(payload: SearchIn, user_id: str = Depends(get_user_id)):
         r["storage_path"] = r.get("storage_path") or r.get("file_path")
 
     return {"results": rows}
-
 
 
 @app.post("/kb/process")

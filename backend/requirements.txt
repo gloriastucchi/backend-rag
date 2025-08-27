@@ -8,3 +8,4 @@ tiktoken
 pypdf
 python-docx
 pymupdf
+psycopg2-binary
