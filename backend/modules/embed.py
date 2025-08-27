@@ -73,25 +73,37 @@ def embed_texts(texts: List[str], model: str = OPENAI_EMBED_MODEL, batch_size: i
 # -------------------------
 # DB ops
 # -------------------------
-def upsert_chunks(*, chunks: List[str], embeddings: List[List[float]], user_id: str, document_id: str) -> List[Dict[str, Any]]:
+def upsert_chunks(
+    *, chunks: List[str], embeddings: List[List[float]],
+    user_id: str, document_id: str
+) -> List[Dict[str, Any]]:
     if len(chunks) != len(embeddings):
         raise ValueError("chunks and embeddings must have same length")
 
     rows = []
     for idx, (content, vec) in enumerate(zip(chunks, embeddings)):
         rows.append({
-            # id: NON lo mettiamo: è bigserial e lo genera Postgres
             "user_id": user_id,
             "document_id": document_id,
             "chunk_index": idx,
             "content": content,
-            "embedding": vec,  # Supabase accetta la lista per pgvector
+            "embedding": vec,
         })
 
     sb = _supabase()
-    # Se hai creato una unique (document_id, chunk_index), puoi usare on_conflict
-    res = sb.table(TABLE_NAME).upsert(rows, on_conflict="document_id,chunk_index").execute()
+    print(f"[embed] writing {len(rows)} rows to {TABLE_NAME}")
+
+    # DEBUG: prova prima con insert "semplice" per vedere errori chiaramente
+    res = sb.table(TABLE_NAME).insert(rows).execute()
+    if getattr(res, "error", None):
+        print(f"[embed] insert error: {res.error}")
+        raise RuntimeError(res.error)
+    print(f"[embed] insert ok: {len(res.data or [])} rows")
     return res.data or []
+
+    # Quando confermi che funziona, puoi tornare a:
+    # res = sb.table(TABLE_NAME).upsert(rows, on_conflict="document_id,chunk_index").execute()
+    # if getattr(res, "error", None): ...
 
 def delete_document_chunks(document_id: str) -> int:
     sb = _supabase()
@@ -103,9 +115,12 @@ def delete_document_chunks(document_id: str) -> int:
 # -------------------------
 def embed_and_upsert_document_text(*, text: str, user_id: str, document_id: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP, model: str = OPENAI_EMBED_MODEL) -> Dict[str, Any]:
     chunks = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
+    print(f"[embed] doc={document_id} chunks={len(chunks)}")
     if not chunks:
         return {"document_id": document_id, "chunks": 0, "inserted": 0}
 
     vectors = embed_texts(chunks, model=model)
+    print(f"[embed] vectors={len(vectors)}")
+
     inserted = upsert_chunks(chunks=chunks, embeddings=vectors, user_id=user_id, document_id=document_id)
     return {"document_id": document_id, "chunks": len(chunks), "inserted": len(inserted), "model": model}

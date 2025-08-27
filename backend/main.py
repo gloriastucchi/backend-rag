@@ -202,7 +202,14 @@ async def kb_upload(
         document_id=document_id,
     )
 
-    return {"document_id": document_id, "embedded_chunks": summary["chunks"]}
+    return {
+        "document_id": document_id,
+        "chunks": summary["chunks"],
+        "inserted": summary["inserted"],    # capire se ha scritto
+        "model": summary["model"],
+        "debug": { "text_len": len(text), "first_120": text[:120] }
+    }
+
 
 class EmbedOneIn(BaseModel):
     document_id: str  # uuid
