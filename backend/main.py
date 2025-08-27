@@ -36,14 +36,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-async def get_user_id(
-    x_user_id: str = Header(..., convert_underscores=False)
-) -> str:
+async def get_user_id(user_id_header: str | None = Header(None, alias="X-User-Id")) -> str:
     """
-    Richiede SEMPRE l'header X-User-Id.
-    Se manca, FastAPI risponde 422 automaticamente.
+    Legge l'header HTTP 'X-User-Id'. Se manca -> 422.
     """
-    return x_user_id
+    if not user_id_header:
+        raise HTTPException(status_code=422, detail="Missing X-User-Id header")
+    return user_id_header
 
 KB_BUCKET = os.getenv("KB_BUCKET", "project-kb")
 
