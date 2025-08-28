@@ -247,17 +247,26 @@ def kb_embed_one(body: EmbedOneIn, user_id: str = Depends(get_user_id)):
     return {"document_id": body.document_id, "embedded_chunks": summary["chunks"]}
 
 
+# --- in main.py ---
+from openai import OpenAI
+import psycopg2, psycopg2.extras
+from datetime import timedelta
+client = OpenAI()
+
+TOP_K = int(os.getenv("RAG_TOP_K", "8"))
+
+def _pg():
+    url = os.getenv("SUPABASE_DB_CONNECTION_STRING")
+    if not url:
+        raise HTTPException(500, "Missing SUPABASE_DB_CONNECTION_STRING")
+    return psycopg2.connect(url)
+
 @app.post("/kb/search")
 def kb_search(payload: SearchIn, user_id: str = Depends(get_user_id)):
-    from openai import OpenAI
-    import psycopg2, psycopg2.extras
-
-    EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-    qvec = OpenAI().embeddings.create(model=EMBED_MODEL, input=payload.query).data[0].embedding
-
-    pg_url = os.getenv("SUPABASE_DB_CONNECTION_STRING")  # postgres://user:pass@host:port/db
-    if not pg_url:
-        raise HTTPException(500, "Missing SUPABASE_DB_CONNECTION_STRING")
+    qvec = client.embeddings.create(
+        model=os.getenv("EMBED_MODEL", "text-embedding-3-small"),
+        input=payload.query
+    ).data[0].embedding
 
     sql = """
     select
@@ -265,29 +274,31 @@ def kb_search(payload: SearchIn, user_id: str = Depends(get_user_id)):
       ue.chunk_index,
       ue.content,
       (ue.embedding <-> %s) as distance,
-      ud.filename, ud.file_name, ud.storage_path, ud.file_path, ud.created_at
+      ud.filename,
+      ud.storage_path,
+      ud.created_at
     from user_embeddings ue
     join user_documents ud on ud.id = ue.document_id
     where ue.user_id = %s
     order by ue.embedding <-> %s
-    limit 10;
+    limit %s;
     """
 
-    try:
-        conn = psycopg2.connect(pg_url)
-        with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, (qvec, user_id, qvec))
-            rows = cur.fetchall()
-        conn.close()
-    except Exception as e:
-        raise HTTPException(500, f"Search failed: {e}")
+    conn = _pg()
+    with conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, (qvec, user_id, qvec, TOP_K))
+        rows = cur.fetchall()
+    conn.close()
 
-    # normalizza campi per il frontend
+    # add signed url for each result
+    svc = get_service_client()
+    out = []
     for r in rows:
-        r["filename"] = r.get("filename") or r.get("file_name")
-        r["storage_path"] = r.get("storage_path") or r.get("file_path")
-
-    return {"results": rows}
+        url = svc.storage.from_(KB_BUCKET).create_signed_url(
+            r["storage_path"], int(timedelta(hours=2).total_seconds())
+        )["signedURL"]
+        out.append({**r, "signed_url": url})
+    return {"results": out}
 
 
 @app.post("/kb/process")
