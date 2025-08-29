@@ -159,6 +159,94 @@ async def extract_requirements(
                 pass
 
 
+@app.post("/extract-scope-from-doc")
+async def extract_scope_from_existing_doc(
+    document_id: str,
+    save: bool = True
+):
+    """
+    Extracts TWO sections from the existing rfq_document:
+    - scope_of_work_text: string (rich text)
+    - deliverables: list[str]
+    If save=True, stores scope_of_work_text in rfq_documents.analysis_data
+    and inserts deliverables into rfq_scope_items with section='Deliverables'.
+    """
+    sb = get_supabase()
+
+    # 0) fetch rfq_documents row
+    res = sb.table("rfq_documents").select("*").eq("id", document_id).single().execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="document not found")
+
+    doc = res.data
+    file_path = doc.get("file_path")
+    file_name = doc.get("file_name") or "document.pdf"
+    if not file_path:
+        raise HTTPException(status_code=400, detail="file_path missing on rfq_documents")
+
+    bucket = os.getenv("RFQ_BUCKET", "rfq_documents")
+
+    # 1) download file temporarily
+    client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
+    try:
+        file_bytes = client.storage.from_(bucket).download(file_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unable to download: {e}")
+
+    suffix = os.path.splitext(file_name)[1] or ".pdf"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
+    try:
+        # 2) LLM extraction (two sections)
+        out = extract_scope_and_deliverables_from_file(tmp_path)
+        scope_text = out.get("scope_of_work_text") or ""
+        deliverables = out.get("deliverables") or []
+
+        # 3) Optional save
+        if save:
+            # status -> analyzing
+            sb.table("rfq_documents").update({"status": "analyzing"}).eq("id", document_id).execute()
+
+            # 3a) save deliverables as rows in rfq_scope_items
+            if deliverables:
+                rows = [{
+                    "document_id": document_id,
+                    "section": "Deliverables",
+                    "text": d,
+                    "order_index": i,
+                    "confidence": 0.9,  # from LLM; tune if you score per-item
+                } for i, d in enumerate(deliverables)]
+                sb.table("rfq_scope_items").insert(rows).execute()
+
+            # 3b) merge scope text into rfq_documents.analysis_data
+            prev = doc.get("analysis_data") or {}
+            prev["scope_of_work_text"] = scope_text
+            prev["deliverables_count"] = len(deliverables)
+
+            sb.table("rfq_documents").update({
+                "status": "analyzed",
+                "analysis_data": prev
+            }).eq("id", document_id).execute()
+
+        return {
+            "document_id": document_id,
+            "scope_of_work_text": scope_text,
+            "deliverables": deliverables
+        }
+
+    except Exception as e:
+        print("\n--- ERROR in /extract-scope-from-doc ---")
+        print(str(e)); traceback.print_exc(); print("--- END ERROR ---\n")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
 @app.post("/kb/upload")
 async def kb_upload(
     file: UploadFile = File(...),
