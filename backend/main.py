@@ -508,22 +508,16 @@ async def generate_answer(req: GenerateRequest):
 
 @app.get("/rfq/scope")
 def get_scope(document_id: str):
-    """
-    Ritorna quanto salvato per il documento:
-    - scope_of_work_text (in rfq_documents.analysis_data)
-    - deliverables (da rfq_scope_items con section='Deliverables')
-    """
+    print(f"[GET /rfq/scope] document_id={document_id}")
     sb = get_supabase()
-
-    # Legge analysis_data
     dres = sb.table("rfq_documents").select("analysis_data").eq("id", document_id).single().execute()
     if not dres.data:
+        print(f"[GET /rfq/scope] NOT FOUND: {document_id}")
         raise HTTPException(status_code=404, detail="document not found")
 
     analysis = dres.data.get("analysis_data") or {}
     scope_text = analysis.get("scope_of_work_text") or ""
 
-    # Legge deliverables
     ires = (sb.table("rfq_scope_items")
               .select("text, order_index")
               .eq("document_id", document_id)
@@ -531,12 +525,14 @@ def get_scope(document_id: str):
               .order("order_index", desc=False)
               .execute())
     deliverables = [row["text"] for row in (ires.data or [])]
+    print(f"[GET /rfq/scope] deliverables={len(deliverables)} chars(scope)={len(scope_text)}")
 
     return {
         "document_id": document_id,
         "scope_of_work_text": scope_text,
         "deliverables": deliverables
     }
+
 
 
 
