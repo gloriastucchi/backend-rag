@@ -10,7 +10,7 @@ import tempfile
 import traceback
 
 from supabase import create_client  # serve solo nell'endpoint extract-requirements-from-doc
-from backend.modules.scope_extraction import extract_scope_and_deliverables_from_file
+from modules.scope_extraction import extract_scope_and_deliverables_from_file
 from modules.supabase_client import get_supabase, get_service_client
 from modules.embed import embed_and_upsert_document_text, delete_document_chunks
 from modules.extract import extract_requirements_from_file
