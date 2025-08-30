@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Depends, Header, Body
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any
@@ -7,28 +7,26 @@ from uuid import uuid4
 import os
 import shutil
 import tempfile
+import asyncio
 import traceback
 
-from supabase import create_client  # serve solo nell'endpoint extract-requirements-from-doc
+from supabase import create_client  # usato per download dallo Storage
 from modules.scope_extraction import extract_scope_and_deliverables_from_file
 from modules.supabase_client import get_supabase, get_service_client
 from modules.embed import embed_and_upsert_document_text, delete_document_chunks
 from modules.extract import extract_requirements_from_file
 
-
 load_dotenv()
-
-# --- RAG / LLM utils ---
-from modules.extract import extract_requirements_from_file
-# from modules.retrieve import retrieve_from_kb
-# from modules.generate import generate_answer_with_refs
-
-# --- Supabase helper ---
-from modules.supabase_client import get_supabase
 
 app = FastAPI()
 
-# CORS per dev (restringi in prod)
+# --------- ENV ---------
+KB_BUCKET = os.getenv("KB_BUCKET", "project-kb")
+RFQ_BUCKET = os.getenv("RFQ_BUCKET", "rfq_documents")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+# --------- CORS (restringi in prod) ---------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,15 +35,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --------- UTILS ---------
+def _log(step: str, **kv):
+    print(f"[extract-scope] {step} :: " + " ".join(f"{k}={kv[k]}" for k in kv))
+
 async def get_user_id(user_id_header: str | None = Header(None, alias="X-User-Id")) -> str:
-    """
-    Legge l'header HTTP 'X-User-Id'. Se manca -> 422.
-    """
     if not user_id_header:
         raise HTTPException(status_code=422, detail="Missing X-User-Id header")
     return user_id_header
-
-KB_BUCKET = os.getenv("KB_BUCKET", "project-kb")
 
 def _extract_text_from_bytes(data: bytes, filename: str) -> str:
     name = (filename or "").lower()
@@ -57,7 +54,6 @@ def _extract_text_from_bytes(data: bytes, filename: str) -> str:
         return data.decode("utf-8", errors="ignore")
     except Exception:
         return ""
-
 
 # ---------- MODELS ----------
 class Requirement(BaseModel):
@@ -78,10 +74,7 @@ class GenerateResponse(BaseModel):
 class SearchIn(BaseModel):
     query: str
 
-
 # ---------- ENDPOINTS ----------
-
-import traceback
 
 @app.post("/extract-requirements")
 async def extract_requirements(
@@ -113,9 +106,7 @@ async def extract_requirements(
                 "project_id": project_id,
                 "title": title or file.filename,
                 "file_name": file.filename,
-                "status": "uploaded",          # ✅ allowed by your CHECK
-                # "user_id": <add later when you have auth/JWT>,
-                # "user_email": <optional mirror>
+                "status": "uploaded",
             }
             doc_ins = sb.table("rfq_documents").insert(payload).execute()
             if not doc_ins or not getattr(doc_ins, "data", None):
@@ -162,66 +153,99 @@ async def extract_requirements(
 
 @app.post("/extract-scope-from-doc")
 async def extract_scope_from_existing_doc(
-    document_id: str,
-    save: bool = True
+    document_id: str = Query(..., description="UUID rfq_documents.id"),
+    save: bool = Query(True),
+    dry_run: bool = Query(False, description="Se true, non chiama l'LLM (debug veloce)"),
 ):
     """
-    Extracts TWO sections from the existing rfq_document:
-    - scope_of_work_text: string (rich text)
-    - deliverables: list[str]
-    If save=True, stores scope_of_work_text in rfq_documents.analysis_data
-    and inserts deliverables into rfq_scope_items with section='Deliverables'.
+    Estrae:
+      - scope_of_work_text: string
+      - deliverables: list[str]
+
+    Se save=True:
+      - salva scope_of_work_text in rfq_documents.analysis_data
+      - salva deliverables in rfq_scope_items (section='Deliverables')
     """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(500, detail="Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
+
     sb = get_supabase()
-
-    # 0) fetch rfq_documents row
-    res = sb.table("rfq_documents").select("*").eq("id", document_id).single().execute()
-    if not res.data:
-        raise HTTPException(status_code=404, detail="document not found")
-
-    doc = res.data
-    file_path = doc.get("file_path")
-    file_name = doc.get("file_name") or "document.pdf"
-    if not file_path:
-        raise HTTPException(status_code=400, detail="file_path missing on rfq_documents")
-
-    bucket = os.getenv("RFQ_BUCKET", "rfq_documents")
-
-    # 1) download file temporarily
-    client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
+    tmp_path = None
     try:
-        file_bytes = client.storage.from_(bucket).download(file_path)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unable to download: {e}")
+        _log("START", document_id=document_id, save=save, dry_run=dry_run)
 
-    suffix = os.path.splitext(file_name)[1] or ".pdf"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
+        # 0) fetch rfq_documents row
+        res = sb.table("rfq_documents").select("*").eq("id", document_id).single().execute()
+        if not res or not getattr(res, "data", None):
+            _log("DOC_NOT_FOUND")
+            raise HTTPException(status_code=404, detail="document not found")
 
-    try:
-        # 2) LLM extraction (two sections)
-        out = extract_scope_and_deliverables_from_file(tmp_path)
-        scope_text = out.get("scope_of_work_text") or ""
-        deliverables = out.get("deliverables") or []
+        doc = res.data
+        file_path = doc.get("file_path")
+        file_name = doc.get("file_name") or "document.pdf"
+        if not file_path:
+            _log("MISSING_FILE_PATH")
+            raise HTTPException(status_code=400, detail="file_path missing on rfq_documents")
 
-        # 3) Optional save
+        _log("DOC_OK", file_path=file_path, file_name=file_name)
+
+        # 1) download file temporarily
+        client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+        _log("DOWNLOAD_BEGIN")
+        try:
+            file_bytes = client.storage.from_(RFQ_BUCKET).download(file_path)
+        except Exception as e:
+            _log("DOWNLOAD_ERROR", err=str(e))
+            raise HTTPException(status_code=500, detail=f"Unable to download: {e}")
+        _log("DOWNLOAD_OK", size=len(file_bytes or b""))
+
+        suffix = os.path.splitext(file_name)[1] or ".pdf"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        _log("TMP_READY", tmp_path=tmp_path)
+
+        # 2) extraction (LLM) con timeout e/o dry-run
+        if dry_run:
+            _log("DRY_RUN")
+            scope_text = "This is a DRY-RUN scope text (no LLM)."
+            deliverables = ["Item A", "Item B", "Item C"]
+        else:
+            async def _run():
+                return extract_scope_and_deliverables_from_file(tmp_path)
+
+            _log("LLM_BEGIN")
+            try:
+                out = await asyncio.wait_for(_run(), timeout=90)  # timeout duro
+            except asyncio.TimeoutError:
+                _log("LLM_TIMEOUT")
+                raise HTTPException(504, detail="Scope extraction timed out")
+            except Exception as e:
+                _log("LLM_ERROR", err=str(e))
+                traceback.print_exc()
+                raise HTTPException(500, detail=f"Scope extraction failed: {e}")
+
+            scope_text = (out or {}).get("scope_of_work_text") or ""
+            deliverables = (out or {}).get("deliverables") or []
+            _log("LLM_OK", scope_len=len(scope_text), deliverables=len(deliverables))
+
+        # 3) save (optional)
         if save:
-            # status -> analyzing
+            _log("SAVE_BEGIN")
             sb.table("rfq_documents").update({"status": "analyzing"}).eq("id", document_id).execute()
 
-            # 3a) save deliverables as rows in rfq_scope_items
+            # idempotenza deliverables
+            sb.table("rfq_scope_items").delete().eq("document_id", document_id).eq("section", "Deliverables").execute()
             if deliverables:
                 rows = [{
                     "document_id": document_id,
                     "section": "Deliverables",
                     "text": d,
                     "order_index": i,
-                    "confidence": 0.9,  # from LLM; tune if you score per-item
+                    "confidence": 0.9,
                 } for i, d in enumerate(deliverables)]
                 sb.table("rfq_scope_items").insert(rows).execute()
 
-            # 3b) merge scope text into rfq_documents.analysis_data
             prev = doc.get("analysis_data") or {}
             prev["scope_of_work_text"] = scope_text
             prev["deliverables_count"] = len(deliverables)
@@ -230,29 +254,34 @@ async def extract_scope_from_existing_doc(
                 "status": "analyzed",
                 "analysis_data": prev
             }).eq("id", document_id).execute()
+            _log("SAVE_OK")
 
+        _log("END_OK")
         return {
             "document_id": document_id,
             "scope_of_work_text": scope_text,
             "deliverables": deliverables
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        print("\n--- ERROR in /extract-scope-from-doc ---")
-        print(str(e)); traceback.print_exc(); print("--- END ERROR ---\n")
+        _log("FATAL", err=str(e))
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
 
 @app.post("/kb/upload")
 async def kb_upload(
     file: UploadFile = File(...),
     user_id: str = Depends(get_user_id),
 ):
-    # usa SEMPRE il service client nel backend per storage + DB write
     sb = get_service_client()
     storage = sb.storage
 
@@ -264,7 +293,7 @@ async def kb_upload(
     except Exception as e:
         raise HTTPException(500, f"Storage upload failed: {e}")
 
-    # 2) Insert in user_documents (schema attuale: file_name/file_path)
+    # 2) Insert in user_documents
     payload = {
         "user_id": user_id,
         "file_name": file.filename,
@@ -292,9 +321,9 @@ async def kb_upload(
     return {
         "document_id": document_id,
         "chunks": summary["chunks"],
-        "inserted": summary["inserted"],    # capire se ha scritto
+        "inserted": summary["inserted"],
         "model": summary["model"],
-        "debug": { "text_len": len(text), "first_120": text[:120] }
+        "debug": {"text_len": len(text), "first_120": text[:120]},
     }
 
 
@@ -303,8 +332,8 @@ class EmbedOneIn(BaseModel):
 
 @app.post("/kb/embed-one")
 def kb_embed_one(body: EmbedOneIn, user_id: str = Depends(get_user_id)):
-    sb = get_service_client()   # ✅ service role per DB
-    storage = sb.storage        # ✅ e per Storage
+    sb = get_service_client()
+    storage = sb.storage
 
     doc = sb.table("user_documents").select("*").eq("id", body.document_id).single().execute().data
     if not doc:
@@ -335,7 +364,7 @@ def kb_embed_one(body: EmbedOneIn, user_id: str = Depends(get_user_id)):
     return {"document_id": body.document_id, "embedded_chunks": summary["chunks"]}
 
 
-# --- in main.py ---
+# --- RAG demo search (ok lasciare così se non usi) ---
 from openai import OpenAI
 import psycopg2, psycopg2.extras
 from datetime import timedelta
@@ -378,7 +407,6 @@ def kb_search(payload: SearchIn, user_id: str = Depends(get_user_id)):
         rows = cur.fetchall()
     conn.close()
 
-    # add signed url for each result
     svc = get_service_client()
     out = []
     for r in rows:
@@ -391,10 +419,9 @@ def kb_search(payload: SearchIn, user_id: str = Depends(get_user_id)):
 
 @app.post("/kb/process")
 async def kb_process(doc_id: str, user_id: str = Depends(get_user_id)):
-    sb = get_service_client()   # ✅ service role
+    sb = get_service_client()
     storage = sb.storage
 
-    # 0) fetch doc (nuova tabella)
     doc = sb.table("user_documents").select("*").eq("id", doc_id).single().execute().data
     if not doc or doc["user_id"] != user_id:
         raise HTTPException(404, "Document not found")
@@ -404,13 +431,11 @@ async def kb_process(doc_id: str, user_id: str = Depends(get_user_id)):
     if not filename or not path:
         raise HTTPException(400, "Missing filename/storage_path")
 
-    # 1) download bytes dal bucket corretto
     try:
         file_bytes = storage.from_(KB_BUCKET).download(path)
     except Exception as e:
         raise HTTPException(500, f"Download failed: {e}")
 
-    # 2) estrai testo e indicizza (riusa la pipeline)
     text = _extract_text_from_bytes(file_bytes, filename)
     if not text.strip():
         raise HTTPException(400, "No extractable text")
@@ -421,10 +446,6 @@ async def kb_process(doc_id: str, user_id: str = Depends(get_user_id)):
         user_id=user_id,
         document_id=doc_id
     )
-
-    # opzionale: marca come indicizzato se hai la colonna
-    # sb.table("user_documents").update({"indexed_at": "now()"}).eq("id", doc_id).execute()
-
     return {"document_id": doc_id, "embedded_chunks": summary["chunks"], "status": "ready"}
 
 
@@ -433,29 +454,20 @@ async def extract_requirements_from_existing_doc(
     document_id: str,
     save: bool = True
 ):
-    """
-    Use when the PDF is already uploaded+tracked in rfq_documents.
-    We fetch it from Supabase Storage (bucket rfq_documents), run extraction,
-    and write results to rfq_requirements.
-    """
-
     sb = get_supabase()
 
-    # 0) fetch rfq_documents row
     res = sb.table("rfq_documents").select("*").eq("id", document_id).single().execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="document not found")
 
     doc = res.data
-    file_path = doc.get("file_path")   # e.g. "user123/abc/testRFP.pdf"
+    file_path = doc.get("file_path")
     if not file_path:
         raise HTTPException(status_code=400, detail="file_path missing on rfq_documents")
 
-    bucket = "rfq_documents"
+    bucket = RFQ_BUCKET
 
-    # 1) download file temporarily
-    client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
-    
+    client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     try:
         file_bytes = client.storage.from_(bucket).download(file_path)
     except Exception as e:
@@ -465,13 +477,14 @@ async def extract_requirements_from_existing_doc(
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
-    # 2) extract requirements
-    reqs = extract_requirements_from_file(tmp_path)
+    try:
+        reqs = extract_requirements_from_file(tmp_path)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
 
-    # delete tmp
-    os.remove(tmp_path)
-
-    # 3) optionally save to rfq_requirements
     if save and reqs:
         rows = [{
             "document_id": document_id,
@@ -483,29 +496,10 @@ async def extract_requirements_from_existing_doc(
         } for r in reqs]
         sb.table("rfq_requirements").insert(rows).execute()
 
-    return {
-        "document_id": document_id,
-        "requirements": reqs
-    }
+    return {"document_id": document_id, "requirements": reqs}
 
 
-@app.post("/search-docs", response_model=SearchResponse)
-async def search_docs(req: Requirement):
-    try:
-        matches = retrieve_from_kb(req.requirement)  # da implementare
-        return {"requirement": req.requirement, "matches": matches}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/generate-answer", response_model=GenerateResponse)
-async def generate_answer(req: GenerateRequest):
-    try:
-        answer, refs = generate_answer_with_refs(req.requirement, req.matches)  # da implementare
-        return {"answer": answer, "references": refs}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+# ---- Scope: lettura risultati salvati ----
 @app.get("/rfq/scope")
 def get_scope(document_id: str):
     print(f"[GET /rfq/scope] document_id={document_id}")
@@ -532,8 +526,6 @@ def get_scope(document_id: str):
         "scope_of_work_text": scope_text,
         "deliverables": deliverables
     }
-
-
 
 
 @app.get("/")
