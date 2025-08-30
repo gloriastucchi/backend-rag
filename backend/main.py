@@ -247,7 +247,6 @@ async def extract_scope_from_existing_doc(
         except Exception:
             pass
 
-
 @app.post("/kb/upload")
 async def kb_upload(
     file: UploadFile = File(...),
